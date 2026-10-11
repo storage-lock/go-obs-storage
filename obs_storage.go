@@ -1,7 +1,6 @@
 package obs_storage
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -9,25 +8,44 @@ import (
 	"strings"
 	"time"
 
-	"github.com/huaweicloud/huaweicloud-sdk-go-obs/obs"
+	"github.com/minio/minio-go/v7"
 	go_iterator "github.com/golang-infrastructure/go-iterator"
 	"github.com/storage-lock/go-storage"
 	storage_lock "github.com/storage-lock/go-storage-lock"
 )
 
+// 存储在对象 value 中的分隔符
 const valueSeparator = "\x00"
 
+// isPreconditionError 检查是否为对象存储前置条件失败错误
+func isPreconditionError(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "PreconditionFailed") ||
+		strings.Contains(errStr, "412") ||
+		strings.Contains(errStr, "pre-condition") ||
+		strings.Contains(errStr, "Condition") ||
+		strings.Contains(errStr, "409")
+}
+
 // OBSStorage 基于华为云 OBS 的存储引擎实现
-// OBS 支持条件 PUT，但不支持原子条件删除，释放走墓碑降级路径
+//
+// OBS 兼容 S3 协议，本实现通过 S3 兼容客户端访问 OBS。
+// CAS 范式与 S3 一致：条件 PUT。
+// - CreateWithVersion: PutObject + If-None-Match:*（对象不存在才写入）
+// - UpdateWithVersion: 先 Get 取 ETag → PutObject + If-Match:<ETag>（ETag 匹配才覆盖）
+// - DeleteWithVersion: 对象存储不支持条件删除，采用“读取-检查-无条件删除”降级方案
+//
+// 时间源由 options.TimeProvider 注入（生产 NTP，测试 LocalTimeProvider）。
 type OBSStorage struct {
-	options      *OBSStorageOptions
-	client       *obs.ObsClient
-	bucket       string
+	options *OBSStorageOptions
+	client  *minio.Client
+
 	timeProvider storage.TimeProvider
 }
 
 var _ storage.Storage = &OBSStorage{}
 
+// NewOBSStorage 创建 OBS 存储引擎
 func NewOBSStorage(ctx context.Context, options *OBSStorageOptions) (*OBSStorage, error) {
 	if err := options.Check(); err != nil {
 		return nil, err
@@ -45,11 +63,18 @@ func (x *OBSStorage) GetName() string {
 	return OBSStorageName
 }
 
+// Capabilities 声明 CAS 和 ReliableTime（通过注入 TimeProvider 满足）
+// - AtomicDelete：对象存储 Delete 无条件删除，释放走墓碑降级
 func (x *OBSStorage) Capabilities() []storage.StorageCapability {
 	return []storage.StorageCapability{
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *OBSStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *OBSStorage) Init(ctx context.Context) error {
@@ -58,7 +83,18 @@ func (x *OBSStorage) Init(ctx context.Context) error {
 		return err
 	}
 	x.client = client
-	x.bucket = x.options.BucketName
+
+	// 确保 Bucket 存在
+	exists, err := client.BucketExists(ctx, x.options.BucketName)
+	if err != nil {
+		return fmt.Errorf("failed to check bucket: %w", err)
+	}
+	if !exists {
+		err = client.MakeBucket(ctx, x.options.BucketName, minio.MakeBucketOptions{Region: x.options.Region})
+		if err != nil {
+			return fmt.Errorf("failed to create bucket: %w", err)
+		}
+	}
 
 	if x.options.TimeProvider != nil {
 		x.timeProvider = x.options.TimeProvider
@@ -68,20 +104,24 @@ func (x *OBSStorage) Init(ctx context.Context) error {
 	return nil
 }
 
+// LocalTimeProvider 本地时间源（导出，供 locks 包注入）
 type LocalTimeProvider struct{}
 
 func (p *LocalTimeProvider) GetTime(ctx context.Context) (time.Time, error) {
 	return time.Now(), nil
 }
 
+// objectKey 返回对象 key
 func (x *OBSStorage) objectKey(lockId string) string {
 	return fmt.Sprintf("%s/lock/%s", x.options.KeyPrefix, lockId)
 }
 
+// encodeValue 编码 version 和 json
 func encodeValue(version storage.Version, jsonStr string) []byte {
 	return []byte(strconv.FormatUint(uint64(version), 10) + valueSeparator + jsonStr)
 }
 
+// decodeValue 解码 version 和 json
 func decodeValue(data []byte) (storage.Version, string, error) {
 	parts := strings.SplitN(string(data), valueSeparator, 2)
 	if len(parts) != 2 {
@@ -95,22 +135,15 @@ func decodeValue(data []byte) (storage.Version, string, error) {
 }
 
 // CreateWithVersion 原子创建锁记录
-// OBS 条件 PUT：使用 If-None-Match: * 防止覆盖已存在的对象
+// PutObject + If-None-Match:*：对象不存在才写入，否则返回前置条件失败错误
 func (x *OBSStorage) CreateWithVersion(ctx context.Context, lockId string, version storage.Version, lockInformation *storage.LockInformation) error {
 	key := x.objectKey(lockId)
 	value := encodeValue(version, lockInformation.ToJsonString())
 
-	// OBS 条件 PUT：If-None-Match: * 表示对象不存在才写入
-	input := &obs.PutObjectInput{
-		Bucket: x.bucket,
-		Key:    key,
-		Body:   bytes.NewReader(value),
-	}
-	input.SetIfNoneMatch("*")
-
-	_, err := x.client.PutObject(input)
+	opts := minio.PutObjectOptions{}
+	opts.SetMatchETagExcept("*") // 仅当对象不存在时写入
+	_, err := x.client.PutObject(ctx, x.options.BucketName, key, strings.NewReader(string(value)), int64(len(value)), opts)
 	if err != nil {
-		// OBS 返回 412 PreconditionFailed 或 409 Conflict 表示对象已存在
 		if isPreconditionError(err) {
 			return storage_lock.ErrLockAlreadyExists
 		}
@@ -120,51 +153,47 @@ func (x *OBSStorage) CreateWithVersion(ctx context.Context, lockId string, versi
 }
 
 // UpdateWithVersion 原子更新锁记录
-// OBS 条件 PUT：先 GetObject 获取 ETag，再 PutObject + If-Match:<ETag>
+// 流程：Get 取 ETag → 检查业务 version → PutObject + If-Match:<ETag>
 func (x *OBSStorage) UpdateWithVersion(ctx context.Context, lockId string, expectedVersion, newVersion storage.Version, lockInformation *storage.LockInformation) error {
 	key := x.objectKey(lockId)
 
-	// 1. GetObject 获取当前版本和 ETag
-	getInput := &obs.GetObjectInput{
-		Bucket: x.bucket,
-		Key:    key,
-	}
-	getOutput, err := x.client.GetObject(getInput)
+	// 取当前对象和 ETag
+	obj, err := x.client.GetObject(ctx, x.options.BucketName, key, minio.GetObjectOptions{})
 	if err != nil {
-		if isNotFoundError(err) {
-			return storage_lock.ErrLockNotFound
+		errStr := err.Error()
+		if strings.Contains(errStr, "NoSuchKey") || strings.Contains(errStr, "404") || strings.Contains(errStr, "does not exist") {
+			// 记录不存在返回 ErrVersionMiss（可重试），对齐 S3 基类/memory 已修口径。
+			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
-	defer getOutput.Body.Close()
-
-	data, err := io.ReadAll(getOutput.Body)
+	defer obj.Close()
+	data, err := io.ReadAll(obj)
 	if err != nil {
 		return err
 	}
+	stat, err := obj.Stat()
+	if err != nil {
+		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "404") {
+			return storage_lock.ErrVersionMiss
+		}
+		return err
+	}
 
+	// 解析当前业务版本
 	currentVersion, _, err := decodeValue(data)
 	if err != nil {
 		return err
 	}
-
-	// 检查版本
 	if currentVersion != expectedVersion {
 		return storage_lock.ErrVersionMiss
 	}
 
-	etag := getOutput.ETag
-	value := encodeValue(newVersion, lockInformation.ToJsonString())
-
-	// 2. PutObject + If-Match:<ETag>
-	putInput := &obs.PutObjectInput{
-		Bucket: x.bucket,
-		Key:    key,
-		Body:   bytes.NewReader(value),
-	}
-	putInput.SetIfMatch(etag)
-
-	_, err = x.client.PutObject(putInput)
+	// 用 ETag 作 CAS 条件覆盖
+	newValue := encodeValue(newVersion, lockInformation.ToJsonString())
+	opts := minio.PutObjectOptions{}
+	opts.SetMatchETag(stat.ETag) // 仅当 ETag 匹配时覆盖
+	_, err = x.client.PutObject(ctx, x.options.BucketName, key, strings.NewReader(string(newValue)), int64(len(newValue)), opts)
 	if err != nil {
 		if isPreconditionError(err) {
 			return storage_lock.ErrVersionMiss
@@ -174,33 +203,63 @@ func (x *OBSStorage) UpdateWithVersion(ctx context.Context, lockId string, expec
 	return nil
 }
 
-// DeleteWithVersion OBS 不支持条件删除，返回 ErrVersionMiss 触发墓碑路径
+// DeleteWithVersion 对象存储不支持条件删除，采用“读取-检查-无条件删除”降级方案
+// 注意：这不是原子操作，检查和删除之间可能有并发修改
+// 但这是对象存储能做到的最佳方案，用于测试场景和清理操作
 func (x *OBSStorage) DeleteWithVersion(ctx context.Context, lockId string, expectedVersion storage.Version, lockInformation *storage.LockInformation) error {
-	return storage_lock.ErrVersionMiss
-}
-
-// Get 获取锁记录
-func (x *OBSStorage) Get(ctx context.Context, lockId string) (string, error) {
 	key := x.objectKey(lockId)
 
-	input := &obs.GetObjectInput{
-		Bucket: x.bucket,
-		Key:    key,
-	}
-	output, err := x.client.GetObject(input)
+	// 取当前对象
+	obj, err := x.client.GetObject(ctx, x.options.BucketName, key, minio.GetObjectOptions{})
 	if err != nil {
-		if isNotFoundError(err) {
+		errStr := err.Error()
+		if strings.Contains(errStr, "NoSuchKey") || strings.Contains(errStr, "404") || strings.Contains(errStr, "does not exist") {
+			return storage_lock.ErrLockNotFound
+		}
+		return err
+	}
+	defer obj.Close()
+	data, err := io.ReadAll(obj)
+	if err != nil {
+		return err
+	}
+
+	// 检查版本是否匹配
+	currentVersion, _, err := decodeValue(data)
+	if err != nil {
+		return err
+	}
+	if currentVersion != expectedVersion {
+		return storage_lock.ErrVersionMiss
+	}
+
+	// 版本匹配，执行删除（注意：这不是原子的）
+	return x.client.RemoveObject(ctx, x.options.BucketName, key, minio.RemoveObjectOptions{})
+}
+
+// Get 获取锁信息
+func (x *OBSStorage) Get(ctx context.Context, lockId string) (string, error) {
+	key := x.objectKey(lockId)
+	obj, err := x.client.GetObject(ctx, x.options.BucketName, key, minio.GetObjectOptions{})
+	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "NoSuchKey") || strings.Contains(errStr, "404") || strings.Contains(errStr, "does not exist") {
 			return "", storage_lock.ErrLockNotFound
 		}
 		return "", err
 	}
-	defer output.Body.Close()
-
-	data, err := io.ReadAll(output.Body)
+	defer obj.Close()
+	data, err := io.ReadAll(obj)
 	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "NoSuchKey") || strings.Contains(errStr, "404") || strings.Contains(errStr, "does not exist") {
+			return "", storage_lock.ErrLockNotFound
+		}
 		return "", err
 	}
-
+	if len(data) == 0 {
+		return "", storage_lock.ErrLockNotFound
+	}
 	_, jsonStr, err := decodeValue(data)
 	if err != nil {
 		return "", err
@@ -208,77 +267,51 @@ func (x *OBSStorage) Get(ctx context.Context, lockId string) (string, error) {
 	return jsonStr, nil
 }
 
+// GetTime 返回注入的时间源
 func (x *OBSStorage) GetTime(ctx context.Context) (time.Time, error) {
 	return x.timeProvider.GetTime(ctx)
 }
 
+// Close 仅清空引用，连接由 ConnectionManager 管理
 func (x *OBSStorage) Close(ctx context.Context) error {
-	if x.client != nil {
-		x.client.Close()
-	}
+	x.client = nil
 	return nil
 }
 
-// List 列出所有锁记录
+// List 通过 ListObjects 枚举 <prefix>/lock/ 前缀下的所有对象
 func (x *OBSStorage) List(ctx context.Context) (go_iterator.Iterator[*storage.LockInformation], error) {
-	prefix := x.options.KeyPrefix + "/lock/"
-
-	input := &obs.ListObjectsInput{
-		Bucket: x.bucket,
-		Prefix: prefix,
-	}
-
-	result, err := x.client.ListObjects(input)
-	if err != nil {
-		return nil, err
-	}
-
+	prefix := fmt.Sprintf("%s/lock/", x.options.KeyPrefix)
 	slice := make([]*storage.LockInformation, 0)
-	for _, obj := range result.Contents {
-		// 获取对象内容
-		getInput := &obs.GetObjectInput{
-			Bucket: x.bucket,
-			Key:    obj.Key,
+
+	objectCh := x.client.ListObjects(ctx, x.options.BucketName, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	})
+	for object := range objectCh {
+		if object.Err != nil {
+			return nil, object.Err
 		}
-		getOutput, err := x.client.GetObject(getInput)
+		obj, err := x.client.GetObject(ctx, x.options.BucketName, object.Key, minio.GetObjectOptions{})
 		if err != nil {
 			continue
 		}
-
-		data, err := io.ReadAll(getOutput.Body)
-		getOutput.Body.Close()
+		data, err := io.ReadAll(obj)
+		obj.Close()
 		if err != nil {
 			continue
 		}
-
+		if len(data) == 0 {
+			continue
+		}
 		_, jsonStr, err := decodeValue(data)
 		if err != nil {
 			continue
 		}
-
 		lockInfo, err := storage.LockInformationFromJsonString(jsonStr)
 		if err != nil {
 			continue
 		}
 		slice = append(slice, lockInfo)
 	}
-
 	return go_iterator.FromSlice(slice), nil
-}
-
-// isPreconditionError 检查是否为 OBS 前置条件失败错误
-func isPreconditionError(err error) bool {
-	errStr := err.Error()
-	return strings.Contains(errStr, "PreconditionFailed") ||
-		strings.Contains(errStr, "412") ||
-		strings.Contains(errStr, "Condition") ||
-		strings.Contains(errStr, "409")
-}
-
-// isNotFoundError 检查是否为对象不存在错误
-func isNotFoundError(err error) bool {
-	errStr := err.Error()
-	return strings.Contains(errStr, "404") ||
-		strings.Contains(errStr, "NoSuchKey") ||
-		strings.Contains(errStr, "Not Found")
 }
